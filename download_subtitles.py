@@ -8,19 +8,8 @@ import hashlib
 from urllib.parse import urlparse, urljoin
 import webvtt
 from datetime import timedelta
-import traceback
 
 CACHE_DIR = ".cache"
-
-def parse_timestamp(timestamp):
-    hours, minutes, seconds = timestamp.split(':')
-    return timedelta(hours=int(hours), minutes=int(minutes), seconds=float(seconds))
-
-def format_timestamp(td):
-    total_seconds = td.total_seconds()
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{int(hours):02d}:{int(minutes):02d}:{seconds:06.3f}"
 
 def get_cache_filename(url):
     return os.path.join(CACHE_DIR, hashlib.md5(url.encode()).hexdigest() + ".txt")
@@ -42,11 +31,6 @@ def parse_timestamp(timestamp):
     hours, minutes, seconds = timestamp.split(':')
     return timedelta(hours=int(hours), minutes=int(minutes), seconds=float(seconds))
 
-def format_timestamp(td):
-    total_seconds = td.total_seconds()
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{int(hours):02d}:{int(minutes):02d}:{seconds:06.3f}"
 
 def parse_vtt_fragment(content):
     pattern = r'(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{3})(.*?)(?=\n\d{2}:\d{2}:\d{2}\.\d{3}|$)'
@@ -84,26 +68,27 @@ async def download_and_concatenate_subtitles(m3u8_url, output_filename=None):
             segment_uris = [urljoin(english_subtitle_uri, segment.uri) for segment in subtitle_playlist.segments]
             
             print(f"Downloading {len(segment_uris)} subtitle segments...")
-            merged_vtt = webvtt.WebVTT()
-            last_end_time = timedelta()
+
+            lines = []
 
             for uri in segment_uris:
                 segment_content = await fetch(session, uri)
-                
                 segment_captions = parse_vtt_fragment(segment_content)
                 for caption in segment_captions:
-                    start = max(last_end_time, parse_timestamp(caption.start))
-                    end = start + (parse_timestamp(caption.end) - parse_timestamp(caption.start))
-                    
-                    merged_vtt.captions.append(webvtt.Caption(
-                        start=format_timestamp(start),
-                        end=format_timestamp(end),
-                        text=caption.text,
-                    ))
-                    
-                    last_end_time = end
+                    content = re.sub(r'align\:.*?\n', '', caption.text.strip())
+                    content = re.sub(r'♪.+♪$', '', content)
+                    content = re.sub(r'\n', ' ', content)
+                    content = re.sub(r'[^a-zA-Z0-9\'\:\-\s\.\,\?\!]+', '', content)
+                    content = re.sub(r'\s{2}+', ' ', content)
+                    if not lines:
+                        lines.append(content.strip())
+                    elif 0 < content.find(':') < 20 and not lines[-1].startswith(content.strip()):
+                        lines.append(content.strip())
+                    else:
+                        lines[-1] = (lines[-1] + ' ' + content).strip()
 
-            merged_vtt.save(output_filename)
+            with open(output_filename, "w", encoding="utf-8") as f:
+                f.write('\n'.join(lines))
 
             print(f"Merged subtitles have been saved to '{output_filename}'")
 
