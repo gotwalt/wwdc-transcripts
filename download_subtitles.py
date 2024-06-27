@@ -6,8 +6,21 @@ import sys
 import os
 import hashlib
 from urllib.parse import urlparse, urljoin
+import webvtt
+from datetime import timedelta
+import traceback
 
 CACHE_DIR = ".cache"
+
+def parse_timestamp(timestamp):
+    hours, minutes, seconds = timestamp.split(':')
+    return timedelta(hours=int(hours), minutes=int(minutes), seconds=float(seconds))
+
+def format_timestamp(td):
+    total_seconds = td.total_seconds()
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{seconds:06.3f}"
 
 def get_cache_filename(url):
     return os.path.join(CACHE_DIR, hashlib.md5(url.encode()).hexdigest() + ".txt")
@@ -24,57 +37,33 @@ async def fetch(session, url):
         with open(cache_filename, 'w', encoding='utf-8') as f:
             f.write(content)
         return content
-
-def clean_webvtt(content):
-    # Remove WebVTT headers, timestamp lines, and other metadata
-    content = re.sub(r'WEBVTT.*?\n', '', content, flags=re.DOTALL)
-    content = re.sub(r'X-TIMESTAMP-MAP=.*?\n', '', content)
-    content = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}.*?\n', '', content)
     
-    # Split content into lines and remove empty lines
-    lines = [line.strip() for line in content.split('\n') if line.strip()]
-    
-    cleaned_lines = []
-    current_speaker = ""
-    current_text = ""
+def parse_timestamp(timestamp):
+    hours, minutes, seconds = timestamp.split(':')
+    return timedelta(hours=int(hours), minutes=int(minutes), seconds=float(seconds))
 
-    def add_current_text():
-        nonlocal current_speaker, current_text, cleaned_lines
-        if current_text:
-            if current_speaker:
-                if current_speaker[0].isupper():  # It's a human speaker
-                    cleaned_lines.append('')  # Add extra newline before human speaker
-                    cleaned_lines.append(f"{current_speaker}: {current_text.strip()}")
-                else:  # It's an effect
-                    cleaned_lines.append(f"[{current_speaker}]")
-                    if current_text.strip():
-                        cleaned_lines.append(current_text.strip())
-            else:
-                cleaned_lines.append(current_text.strip())
-            current_text = ""
+def format_timestamp(td):
+    total_seconds = td.total_seconds()
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{seconds:06.3f}"
 
-    for line in lines:
-        if line.startswith('['):
-            add_current_text()
-            # Remove opening and closing brackets, and strip any whitespace
-            current_speaker = line.strip('[]').strip()
-        else:
-            current_text += " " + line if current_text else line
-
-    add_current_text()  # Add any remaining text
-
-    return '\n'.join(cleaned_lines)
+def parse_vtt_fragment(content):
+    pattern = r'(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{3})(.*?)(?=\n\d{2}:\d{2}:\d{2}\.\d{3}|$)'
+    matches = re.findall(pattern, content, re.DOTALL)
+    return [webvtt.Caption(start, end, text.strip()) for start, end, text in matches]
 
 async def download_and_concatenate_subtitles(m3u8_url, output_filename=None):
     try:
         parsed_url = urlparse(m3u8_url)
         if output_filename is None:
             base_filename = os.path.splitext(os.path.basename(parsed_url.path))[0]
-            output_filename = f"{base_filename}_english_subtitles.txt"
+            output_filename = f"{base_filename}_english_subtitles.vtt"
 
         async with aiohttp.ClientSession() as session:
             print(f"Attempting to download: {m3u8_url}")
-            m3u8_content = await fetch(session, m3u8_url)
+            async with session.get(m3u8_url) as response:
+                m3u8_content = await response.text()
 
             playlist = m3u8.loads(m3u8_content)
 
@@ -88,27 +77,41 @@ async def download_and_concatenate_subtitles(m3u8_url, output_filename=None):
             english_subtitle_uri = urljoin(m3u8_url, english_subtitle_uri)
 
             print(f"Downloading English subtitles from: {english_subtitle_uri}")
-            subtitle_m3u8_content = await fetch(session, english_subtitle_uri)
+            async with session.get(english_subtitle_uri) as response:
+                subtitle_m3u8_content = await response.text()
             subtitle_playlist = m3u8.loads(subtitle_m3u8_content)
 
             segment_uris = [urljoin(english_subtitle_uri, segment.uri) for segment in subtitle_playlist.segments]
             
             print(f"Downloading {len(segment_uris)} subtitle segments...")
-            tasks = [fetch(session, uri) for uri in segment_uris]
-            subtitle_contents = await asyncio.gather(*tasks)
+            merged_vtt = webvtt.WebVTT()
+            last_end_time = timedelta()
 
-            full_subtitles = "\n".join(subtitle_contents)
-            cleaned_subtitles = clean_webvtt(full_subtitles)
+            for uri in segment_uris:
+                segment_content = await fetch(session, uri)
+                
+                segment_captions = parse_vtt_fragment(segment_content)
+                for caption in segment_captions:
+                    start = max(last_end_time, parse_timestamp(caption.start))
+                    end = start + (parse_timestamp(caption.end) - parse_timestamp(caption.start))
+                    
+                    merged_vtt.captions.append(webvtt.Caption(
+                        start=format_timestamp(start),
+                        end=format_timestamp(end),
+                        text=caption.text,
+                    ))
+                    
+                    last_end_time = end
 
-            with open(output_filename, "w", encoding="utf-8") as f:
-                f.write(cleaned_subtitles)
+            merged_vtt.save(output_filename)
 
-            print(f"Cleaned subtitles have been saved to '{output_filename}'")
+            print(f"Merged subtitles have been saved to '{output_filename}'")
 
     except aiohttp.ClientError as e:
         print(f"An error occurred while making a request: {e}")
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
+        raise  # This will print the full traceback
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or len(sys.argv) > 3:
